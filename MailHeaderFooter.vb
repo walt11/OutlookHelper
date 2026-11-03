@@ -271,7 +271,7 @@ Public Class MailHeaderFooter
             anchor = PrepareAnchorBefore(0, spacerBefore:=False)
         Else
             ' [message + signature][spacer][footer table][spacer][quoted history]
-            anchor = PrepareAnchorBefore(FooterInsertPosition(), spacerBefore:=True)
+            anchor = PrepareFooterAnchor()
         End If
 
         Dim tbl = _doc.Tables.Add(anchor, 1, 1)
@@ -287,21 +287,51 @@ Public Class MailHeaderFooter
     End Function
 
     ''' <summary>
-    ''' Where a new footer goes: just above the quoted history if there is one,
-    ''' otherwise at the end of the message.
+    ''' Creates the paragraphs for a new footer at the END of the active message.
+    ''' The footer is inserted after the last paragraph above the quoted history,
+    ''' never at the start of the history itself. Inserting at the start of the
+    ''' history would put it inside Outlook's separator block (below the line) and
+    ''' inside the _MailOriginal bookmark, where it can't be found again.
     ''' </summary>
-    Private Function FooterInsertPosition() As Integer
+    Private Function PrepareFooterAnchor() As Word.Range
         Dim boundary = FindQuoteBoundary()
-        If boundary >= 0 Then Return boundary
 
-        ' No history: use an empty paragraph at the very end
-        Dim last = _doc.Paragraphs.Last.Range
-        If last.Text <> vbCr Then
-            _doc.Content.InsertParagraphAfter()
-            last = _doc.Paragraphs.Last.Range
+        ' New email (no history): add at the very end
+        If boundary <= 0 Then
+            _doc.Content.InsertParagraphAfter()   ' spacer
+            _doc.Content.InsertParagraphAfter()   ' becomes the table
+            Dim lastPara = _doc.Paragraphs.Last.Range
+            ResetParagraphFormat(_doc.Range(Math.Max(lastPara.Start - 1, 0), lastPara.End))
+            Return lastPara
         End If
-        Return last.Start
+
+        ' Paragraph mark of the last paragraph above the history
+        Dim pos = boundary - 1
+
+        ' Active message ends with a table: no paragraph mark to split here,
+        ' so fall back to inserting just before the history
+        If CBool(_doc.Range(pos, pos).Information(Word.WdInformation.wdWithInTable)) Then
+            Return PrepareAnchorBefore(boundary, spacerBefore:=True)
+        End If
+
+        ' Split that paragraph mark into three new empty paragraphs:
+        ' [spacer][table][spacer], all above the history
+        _doc.Range(pos, pos).InsertAfter(vbCr & vbCr & vbCr)
+        ResetParagraphFormat(_doc.Range(pos + 1, pos + 4))
+
+        Return _doc.Range(pos + 2, pos + 2).Paragraphs(1).Range
     End Function
+
+    ''' <summary>Normal style, no borders, no indents.</summary>
+    Private Sub ResetParagraphFormat(r As Word.Range)
+        Try
+            r.Style = _doc.Styles(Word.WdBuiltinStyle.wdStyleNormal)
+            r.ParagraphFormat.Borders.Enable = 0
+            r.ParagraphFormat.LeftIndent = 0
+            r.ParagraphFormat.RightIndent = 0
+        Catch
+        End Try
+    End Sub
 
     ''' <summary>
     ''' Inserts empty paragraphs at a paragraph-start position and returns the one
@@ -326,14 +356,7 @@ Public Class MailHeaderFooter
             _doc.Range(pos, pos).InsertParagraphBefore()
         Next
 
-        Try
-            Dim block = _doc.Range(pos, pos + total)
-            block.Style = _doc.Styles(Word.WdBuiltinStyle.wdStyleNormal)
-            block.ParagraphFormat.Borders.Enable = 0
-            block.ParagraphFormat.LeftIndent = 0
-            block.ParagraphFormat.RightIndent = 0
-        Catch
-        End Try
+        ResetParagraphFormat(_doc.Range(pos, pos + total))
 
         Dim tablePara = pos + If(spacerBefore, 1, 0)
         Return _doc.Range(tablePara, tablePara).Paragraphs(1).Range
@@ -362,9 +385,10 @@ Public Class MailHeaderFooter
     ''' Returns the character position where the quoted history starts, or -1
     ''' for a new message. Checks, in order, and takes the earliest hit:
     '''   1. Outlook's hidden _MailOriginal bookmark
-    '''   2. The reply separator: a paragraph with a top border containing a
-    '''      colon (the "From: ... Sent: ..." block), or "-----Original Message-----"
-    '''   3. A horizontal line (&lt;hr&gt;) used as a separator
+    '''   2. Outlook's separator block: a division with a top border
+    '''   3. A paragraph with a top border containing a colon (the
+    '''      "From: ... Sent: ..." block), or "-----Original Message-----"
+    '''   4. A horizontal line (&lt;hr&gt;) used as a separator
     ''' Anything inside the add-in's own container tables is skipped, so a
     ''' footer that contains borders, lines or tables can't be mistaken for it.
     ''' </summary>
@@ -383,7 +407,16 @@ Public Class MailHeaderFooter
 
         Dim ours = GetContainerRanges()
 
-        ' 2. Separator paragraph (stop at the first one)
+        ' 2. Outlook's separator block: an HTML division with a top border
+        '    (the line above "From: ... Sent: ..."). Word keeps it as a division,
+        '    so the border isn't always visible as a paragraph border.
+        Try
+            Dim divStart = FindSeparatorDivision(_doc.HTMLDivisions, boundary, ours)
+            If divStart >= 0 Then boundary = divStart
+        Catch
+        End Try
+
+        ' 3. Separator paragraph (stop at the first one)
         For Each p As Word.Paragraph In _doc.Paragraphs
             Dim r = p.Range
             If r.Start >= boundary Then Exit For
@@ -394,7 +427,7 @@ Public Class MailHeaderFooter
             End If
         Next
 
-        ' 3. Horizontal line (stop at the first one)
+        ' 4. Horizontal line (stop at the first one)
         For Each s As Word.InlineShape In _doc.InlineShapes
             Dim pos = s.Range.Start
             If pos >= boundary Then Exit For
@@ -406,6 +439,31 @@ Public Class MailHeaderFooter
         Next
 
         Return If(boundary = Integer.MaxValue, -1, boundary)
+    End Function
+
+    ''' <summary>
+    ''' Searches divisions (and nested divisions) for the first one with a top
+    ''' border whose first paragraph contains a colon. Returns its start, or -1.
+    ''' </summary>
+    Private Shared Function FindSeparatorDivision(divs As Word.HTMLDivisions, limit As Integer,
+                                                  ours As List(Of Tuple(Of Integer, Integer))) As Integer
+        For Each d As Word.HTMLDivision In divs
+            Dim start = d.Range.Start
+            If start >= limit Then Exit For
+            If InsideAny(start, ours) Then Continue For
+
+            Try
+                If d.Borders(Word.WdBorderType.wdBorderTop).LineStyle <> Word.WdLineStyle.wdLineStyleNone AndAlso
+                   d.Range.Paragraphs(1).Range.Text.Contains(":") Then
+                    Return start
+                End If
+            Catch
+            End Try
+
+            Dim nested = FindSeparatorDivision(d.HTMLDivisions, limit, ours)
+            If nested >= 0 Then Return nested
+        Next
+        Return -1
     End Function
 
     Private Shared Function IsSeparatorParagraph(r As Word.Range) As Boolean
